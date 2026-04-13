@@ -1,0 +1,480 @@
+---
+title: "The Impact of Reduced Average Days to Ship on Sales"
+format: html
+editor: visual
+embed-resources: true
+---
+
+```{r}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+## Project Summary
+
+Our client, Wayfair, is an American e-commerce company which sells furniture and home goods. For their 2027 big project, they are planning to build a logistical hub center to enhance shipping speed all over the US states.
+
+However, before they start planning this \$335M project, they want us to answer this question: **How does the reduced average days to ship affect generated sales?**
+
+They will need the estimate of numbers in the sales difference in order to officially launch this project or not.
+
+#### DAG Analysis
+
+From the DAG analysis, the criteria are Y (Outcome - Sales by products), X(Treatment - Average days to ship), A (Confounders - category, weight, fulfillment type, price, popularity ), and IV(weather exposure).
+
+The DAG shows A → X, A → Y, X → Y, which illustrates that A affect both X and Y, creating a backdoor path between X and Y and leading to potential omitted variable bias. IV provides exogenous variation in X that is independent of A, allowing us to identify the causal effect of X on Y. With IV, the DAG shows IV → X → Y (Not IV → Y directly), and IV ⟂ A.
+
+#### Methods Used
+
+We estimate this effect using three steps: a baseline OLS model, a multivariate OLS controlling for product characteristics, and an IV (2SLS) model using weather exposure as an external source of variation in shipping delays. This progression allows us to address omitted variable bias and endogeneity.
+
+#### Results of Analysis
+
+Across all models, shipping time has a negative and significant effect on sales. The impact becomes smaller after adding controls and using IV, showing that simple OLS overstated the effect. The IV estimate indicates that each additional day of delay reduces annual sales by about -13% per product.
+
+| Method           | Coefficient |
+|------------------|-------------|
+| Short Regression | -13.5%/day  |
+| Long Regression  | -14.4%/day  |
+| 2SLS (IV)        | -13.3%/day  |
+
+#### Business Implications to Clients
+
+Delivery speed is a key revenue driver. Even small delays can meaningfully reduce sales, so improving logistics and fulfillment efficiency can generate measurable returns. Products more prone to delays may offer the greatest gains from targeted shipping improvements.
+
+Therefore, assuming this investment reduces average delivery time by **one day** for all customers, Wayfair could generate approximately **\$36.3 million in additional annual revenue, and a total of 309.3 million annual revenue** across **10,000 customers**.
+
+With the project cost estimated at **\$335 million**, the investment would generate approximately **\$36 million in additional annual revenue**, implying an annual ROI of about **10.8%** and a payback period of roughly **9 years**.
+
+## Data Simulation
+
+The following is the data to be used.
+
+#### **Dataset Dictionary**
+
+-   product_id: string, primary key for individual products
+
+-   category: categorical, 1=living room, 2=bedroom, 3=dining, 4=home office, 5=storage & organization, 6=decor
+
+-   weight: continuous float, unit is lbs
+
+-   fulfillment_type: binary, 0=Wayfair-managed fulfillment, 1=third-party fulfillment
+
+-   price: continuous float, unit is USD
+
+-   popularity: continuous index between 0 and 1, interpreted as baseline product demand
+
+-   weather_exposure: integer, defined as the number of days with severe weather (e.g. storms, heavy snow, flooding) affecting shipments for that product during 2025
+
+-   avg_days_to_ship: integer variable between 1 and 14, represents the product's average days to ship
+
+-   sales: continuous float, unit is USD, represents total product revenue in 2025
+
+#### **DAG Dictionary**
+
+-   Outcome (Y): sales revenue
+
+-   Treatment (X): avg_days_to_ship
+
+-   Treatment Effect: The impact of average days to ship on sales
+
+-   Confounder (A): product category, weight, fulfillment_type, price, popularity
+
+-   Instrumental Variable (IV): weather_exposure
+
+#### **Data Distribution**
+
+-   The dataset was made by LLM (Claude) with being cross-sectional, realistic, internally consistent. (<https://claude.ai/share/84172f80-f722-4a10-924e-976e1a56d745>)
+
+-   sales (Y)
+
+    -   It has a positive correlation with 'popularity' and 'price' (but with diminishing returns), and a negative correlation with 'avg_days_to ship'.
+
+-   avg_days_to_ship (X)
+
+    -   It is positively affected by 'weather_exposure', 'weight', and 'third-party fulfillment' in 'fulfillment_type'.
+
+    -   It includes random noise, but ensures strong correlation with 'weather_exposure'.
+
+-   Distribution of other confounders (A)
+
+    -   category: approximately 30% for living room, 25% for bedroom, dining for 15%, 12% for home office, 10% for storage & organization, and 8% for decor.
+
+    -   weight: 10-260 for living room, 9-220 for bedroom, 6-160 for dining, 5-90 for home office, 2-170 for storage & organization, 0.2-5 for decor. Distribution is right-skewed because most products are light, few is very heavy.
+
+    -   fulfillment_type: approximately 70-80% for third-party (1), 20-30% for Wayfair-managed (0).
+
+    -   price: It is positively correlated with 'weight' and right-skewed.
+
+    -   popularity: The distribution is skewed toward low value because there are many low-popularity products and few highly popular ones in reality.
+
+## EDA
+
+```{r}
+rm(list=ls()) # clear workspace
+cat("\014")  # clear console
+
+library(tidyverse)
+library(skimr)
+
+url <- "https://raw.githubusercontent.com/jyubin0114/Wayfair/refs/heads/main/wayfair_product_data.csv"
+df <- read.csv(url)
+
+# Basic structure + missingness check
+glimpse(df)
+skim(df)
+```
+
+#### Distribution of Outcome and Treatment
+
+```{r}
+ggplot(df, aes(x = sales)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of Annual Sales",
+       x = "Sales (USD)", y = "Count")
+```
+
+From this plot we can see that sales are strongly right-skewed. Most products generate relatively modest revenue, while a small number of items account for very large sales. This long right tail means the mean is influenced by a few high-revenue products, so later regressions should consider *log transformations* and robust standard errors to reduce the influence of extreme values.
+
+```{r}
+ggplot(df, aes(x = avg_days_to_ship)) +
+  geom_bar() +
+  labs(title = "Distribution of Average Days to Ship",
+       x = "Days to Ship", y = "Count")
+```
+
+#### Initial Relationship: Shipping Time and Sales
+
+```{r}
+sales_by_ship <- df %>%
+  group_by(avg_days_to_ship) %>%
+  summarise(mean_sales = mean(sales),
+            median_sales = median(sales),
+            n = n(),
+            .groups = "drop")
+
+sales_by_ship
+```
+
+```{r}
+ggplot(sales_by_ship, aes(x = avg_days_to_ship, y = mean_sales)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Mean Sales vs Days to Ship",
+       x = "Days to Ship", y = "Mean Sales (USD)")
+```
+
+The table and line chart show a clear downward pattern: products that ship faster tend to have higher average sales, while sales decline as delivery time increases. This suggests customers are sensitive to shipping speed, and faster fulfillment is associated with stronger product performance.
+
+However, this is only a raw relationship. Products with longer shipping times may systematically differ in weight, fulfillment method, or baseline popularity, which could also affect sales. This means the simple pattern in the chart may reflect both customer response to shipping speed and underlying product differences.
+
+#### Confounding Patterns
+
+```{r}
+df %>%
+  select(sales, avg_days_to_ship, price, weight, popularity, weather_exposure, fulfillment_type) %>%
+  cor() %>%
+  round(3)
+```
+
+Sales are negatively correlated with shipping time (−0.211), suggesting that slower delivery is associated with lower revenue. However, shipping time is also strongly related to weight (0.48), price (0.32), and especially weather exposure (0.60). At the same time, sales are strongly driven by popularity (0.55).
+
+How does confounders affect to X(Average Days to Ship)?
+
+-   **Product Popularity**
+
+    For high-demand products, suppliers and fulfillment systems tend to prioritize inventory allocation and logistics capacity, resulting in FASTER shipping times. In contrast, low-demand products are less likely to receive such priority and may be stocked in only a limited number of warehouses, leading to LONGER average shipping times.
+
+-   **Product Weight**
+
+    For heavy furniture, this requires special handling, which would lead to LONGER shipping times**,** whereas lighter furniture would need less supervision, leading to FASTER shipping times.
+
+-   **Product Category**
+
+    For higher value categories as electronics/decor(Category 6), this would most likely be associated to prioritized shipping, leading to FASTER shipping times, whereas less-valuable categories as regular furniture(Category 1-2) would require LONGER shipping times.
+
+-   **Fulfillment Type**
+
+    For products that are managed by Wayfair(0), this would mean FASTER shipping dates for compliance of internal regulations. Whereas, Third-party(1) products might vary and lead to SLOWER shipping.
+
+-   **Price**
+
+    For higher priced items, which can be due to product weights in need of special handling, the pricier items lead to SLOWER shipping. In contrast, cheaper items have the FASTER delivery with standard procedures.
+
+This shows shipping time is not random — it is tied to product size, cost, and logistics conditions, which are also related to sales. This creates clear risk of omitted variable bias if these factors are not controlled for.
+
+```{r}
+df %>%
+  mutate(ship_bin = cut(avg_days_to_ship,
+                        breaks = c(0,3,6,9,14),
+                        labels = c("1-3","4-6","7-9","10-14"))) %>%
+  group_by(ship_bin) %>%
+  summarise(mean_price = mean(price),
+            mean_weight = mean(weight),
+            mean_popularity = mean(popularity),
+            pct_third_party = mean(fulfillment_type == 1),
+            n = n()
+  )
+```
+
+Grouping products by delivery speed reveals systematic differences: Slower-shipping products are heavier, more expensive, more likely to use third-party fulfillment, and slightly less popular. These characteristics affect both shipping time and sales, confirming that naive comparisons would mix shipping effects with product-type differences. This supports the need for controlled regressions and motivates the IV strategy.
+
+#### Instrument Relevance Check
+
+```{r}
+ggplot(df, aes(x = weather_exposure, y = avg_days_to_ship)) +
+  geom_jitter(alpha = 0.2) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "Weather Exposure vs Shipping Time",
+       x = "Weather Exposure", y = "Days to Ship")
+```
+
+The plot shows a clear positive relationship between weather exposure and shipping time — more severe weather is associated with longer delivery delays. This confirms the relevance condition for an instrumental variable: weather strongly predicts days to ship (correlation ≈ 0.60).
+
+#### EDA Summary and Implications
+
+Overall, the EDA shows three key patterns. First, faster shipping is associated with higher sales, suggesting delivery speed may matter for customer demand. Second, shipping time is systematically related to product characteristics such as weight, price, fulfillment type, and popularity, indicating that shipping speed is not randomly assigned and raising strong risk of omitted variable bias. Third, weather exposure strongly predicts shipping time, supporting its use as an instrumental variable.
+
+These findings guide our methodology: we use log/robust regression to handle skewed sales, include product characteristics as controls to reduce confounding, and implement IV estimation to isolate the causal effect of shipping speed. The EDA therefore suggests that reducing delivery time is likely beneficial for sales, but careful causal methods are required to separate true shipping effects from product differences.
+
+## Methodology
+
+1.  Non-technical description
+
+To understand how shipping speed truly affects sales, we cannot simply look at the raw correlation. To consider other variables that might affect sales and to segregate them from the causation effect as possible, we ran three modeling tests.
+
+First, we performed a simple regression, not considering other attributes. Then we considered 5 different aspects that might impact the Finally, to account for "hidden" factors we can't measure that might affect the shipping speed, we used **weather delays** as a "natural experiment." Since weather causes shipping delays but doesn't change how much a customer likes a sofa, it allows us to isolate the "pure" effect of shipping time on sales.
+
+2.  Technical Description
+
+**Multivariate OLS**: To consider the OVB, we used a multivariate OLS model(Long Model) to estimate the sales. With 5 confounders in total in consideration, which are product characteristics likely to affect both shipping time and sales, we reduce OVB.
+
+**Sensitivity Analysis**: From the models built (short, long), we applied a Sensitivity analysis to confirm the robustness value(RV) to calculate the strengths of unobserved confounders needed to reject the hypothesis/statistical causation.
+
+**Instrumental Variables**(2SLS): By including our predefined confounders on both sides of the pipe operator, we ensure the model treats them as instruments for themselves, which is necessary for consistent estimation of the treatment effect.
+
+3.  Justification of Methods & Assumptions
+
+-   **OLS:** We use OLS as a baseline to identify the direction of bias. With a linear regression model, we see the marginal effect of an additional day of shipping delay having a constant marginal impact on sales.
+
+-   IV (**weather_exposure):** This is justified because it meets the two core IV conditions:
+
+    1.  **Relevance Assumption:** Severe weather creates severe disruptions to the delivery schedules (eg. The winter storm causing big delays in delivery).
+
+    2.  **Exclusion Restriction:** The weather events in the shipping network do not directly influence a customer's desire to purchase a product, affecting sales *only* through the delivery delay.
+
+#### OVB (Omitted Variable Bias)
+
+```{r}
+library(modelsummary)
+library(sensemakr)
+```
+
+For the **1.Short regression** without consideration of the bias is the following:
+
+$$\text{log_Sales} = \beta_0^s + \beta_1^s \text{AverageDaysToShip} + \nu$$
+
+```{r}
+l.sales <- log(df$sales)
+model_short <- lm(l.sales ~ avg_days_to_ship, data = df)
+```
+
+For the true, long regression model the formula is the following:
+
+$$\text{log_Sales} = \beta_0 + \beta_1 \text{AverageDaysToShip} + \gamma_1 \text{Category} + \gamma_2 \text{Weight} + \gamma_3 \text{Price} + \gamma_4 \text{Popularity} + \gamma_5 \text{FulfillmentType} + \epsilon$$
+
+```{r}
+model_long <- lm(l.sales ~ avg_days_to_ship + popularity + price + weight + fulfillment_type + category, data = df)
+```
+
+Below is the comparison of these two models (short, long).
+
+```{r}
+msummary(list("Short" = model_short, "Long" = model_long), 
+         stars = TRUE)
+
+short_coef <- (coef(model_short)["avg_days_to_ship"])
+long_coef <- (coef(model_long)["avg_days_to_ship"])
+
+list(short_coef,long_coef)
+```
+
+With log of sales being the estimate and each variables acting as the determinant factors (short: average days to ship, long: average days to ship + confounders), we see the p-values are minimal (0.005), suggesting a strong model.
+
+For the short model, the coefficient for avg_days to ship is -0.135, meaning for an additional day added for shipment, 13.5% of the sales decrease.
+
+For the long model, the coefficient for avg_days to ship is -0.144, meaning for an additional day added for shipment, 14.4% of the sales decrease.
+
+##### OVB Sensitivity Analysis
+
+Now, we analyze the sensitivity of the short model.
+
+```{r}
+sensitivity.short <- sensemakr(model = model_short, 
+                               treatment = "avg_days_to_ship")
+summary(sensitivity.short)
+```
+
+```{r}
+plot(sensitivity.short, sensitivity.of = "t-value")
+```
+
+The results show that an omitted variable would need to explain at least **25% of the residual variation in both shipping time and sales** to fully eliminate the estimated effect, and over **23%** to make it statistically insignificant at the 5% level. This represents an implausibly strong confounder relative to typical product characteristics.
+
+Now, we compute the sensitivity of the long model.
+
+```{r}
+sensitivity.long <- sensemakr(model = model_long, 
+                              treatment = "avg_days_to_ship")
+summary(sensitivity.long)
+```
+
+```{r}
+plot(sensitivity.long, sensitivity.of = "t-value")
+```
+
+The results indicate that an omitted variable would need to explain at least **26.6% of the residual variation in both shipping time and sales** to completely eliminate the estimated effect, and more than **25.1%** to render it statistically insignificant at the 5% level. This results are slightly higher than the short model, but still suggests room for improvement.
+
+#### IV (Instrumental Variables)
+
+While we were able to mitigate omitted variable bias through consideration of confounders, still exists some unmeasured values that might still cause bias. To address this concern, we apply the IV approach using **weather exposure** as a source of exogenous variation in shipping times.
+
+As severe weather events create logistical bottlenecks and delays in shipment, this variable is strongly strongly correlated to \`avg_days_to_ship\`. Also, disruptions in the delivery schedule may potentially impact 'sales', but weather exposure does not directly impact 'sales', making it a good option for an IV.
+
+##### IV Regression
+
+```{r}
+library(ivreg)
+model_iv <- ivreg(l.sales ~ avg_days_to_ship + popularity + price + weight + fulfillment_type + category | weather_exposure + popularity + price + weight + fulfillment_type + category, 
+ data = df)
+
+iv_coef <- (coef(model_iv)["avg_days_to_ship"])
+
+summary(model_iv)
+iv_coef
+```
+
+Now, we compare the three regressions (short/long and IV regression) to see the optimal model.
+
+```{r}
+msummary(list("OLS (Short)" = model_short, 
+              "OLS (Long)" = model_long, 
+              "IV (2SLS)" = model_iv), 
+         stars = TRUE,
+         title = "Comparison of Causal Models")
+```
+
+## Findings
+
+### Executive summary
+
+Our analysis identifies a consistent and statistically significant negative relationship between delivery duration and annual sales. Using a sequence of econometric models to isolate causal effects, we found that even after controlling for observable product characteristics and addressing endogeneity through Instrumental Variable (IV) estimation, slower shipping directly reduces revenue. Specifically, our most robust model, IV (2SLS), indicates that an additional day in average shipping time leads to an approximate **13.3% decrease in annual sales per product**.
+
+### Main results
+
+The table below compares three models: a baseline OLS, an OLS model with controls, and an IV (2SLS). Across all models, the coefficient on avg_days_to_ships is negative and statistically significant. Notably, the magnitude of the coefficient increases when observable controls are added, indicating that the baseline OLS estimate understates the negative impact of shipping delays due to omitted variable bias. The IV estimate is slightly smaller in magnitude, consistent with the interpretation that IV identifies a local average treatment effect driven by exogenous weather, induced shipping delays.
+
+```{r}
+modelsummary::msummary(
+  list(
+    "OLS (Short)" = model_short,
+    "OLS (Long)"  = model_long,
+    "IV (2SLS)"   = model_iv
+  ),
+  statistic = "std.error",
+  stars = TRUE
+)
+```
+
+```{r}
+data.frame(
+  Model = c("OLS (baseline)", "OLS (+ controls)", "IV (2SLS)"),
+  Estimate = c(
+    coef(model_short)["avg_days_to_ship"],
+    coef(model_long)["avg_days_to_ship"],
+    coef(model_iv)["avg_days_to_ship"]
+  )
+)
+```
+
+### Technical discussion
+
+#### OLS: baseline vs controls (OVB)
+
+$$\text{Sales}_i = \beta_0 + \beta_1 \text{AverageDaysToShip}_i + \epsilon_i$$
+
+```{r}
+summary(model_short)
+```
+
+In the short OLS model, average shipping time has a coefficient of -13.5%, and with p-value being very small(2e-16), this first seems like a plausible regression.
+
+$$\text{Sales} = \beta_0 + \beta_1 \text{AverageDaysToShip} + \gamma_1 \text{Category} + \gamma_2 \text{Weight} + \gamma_3 \text{Price} + \gamma_4 \text{Popularity} + \gamma_5 \text{FulfillmentType} + \epsilon$$
+
+```{r}
+summary(model_long)
+```
+
+However, when compared the short model to the long regression, adding controls (popularity, price, weight, fulfillment type, category), the coefficient on shipping time becomes larger in magnitude, at -14.37%, but remains highly statistically significant(p-value=2e-16, 5). This pattern is consistent with the omitted variable bias in the baseline model. Specifically, the baseline OLS estimate appears to understate the negative effect of shipping delays because products with longer shipping times also differ systematically in other characteristics that affect sales. Once these confounding factors are controlled for, the adverse impact of delivery delays becomes more pronounced.
+
+Nevertheless, according to the sensitivity analysis, the short model shows that an omitted variable would need to explain at least **25% of the residual variation in both shipping time and sales**, and for the long model, **26.6% of the residual variation in both shipping time and sales** to completely eliminate the estimated effect, showing very strong robustness claims for both.
+
+#### IV (2SLS) estimate
+
+To address potential endogeneity in avg_days_to_ship, we estimate a 2SLS model using weather_exposure as an instrument variable. The IV estimate remains negative and significant, but its magnitude is somewhat smaller than OLS estimate with controls. This pattern suggests OLS may be overstating the causal effect of shipping delays due to unobserved confounding.
+
+The IV estimate can be interpreted as a local average treatment effect (LATE), capturing the impact of shipping delays for products whose delivery times are affected by exogenous weather shocks. These weather-induced delays may have a smaller marginal effect on sales than delivery delays driven by persistent logistical or demand-related factors, which explains why the IV estimate is smaller in magnitude.
+
+#### IV diagnostics
+
+```{r}
+summary(model_iv, diagnostics = TRUE)
+```
+
+The IV estimate for average days to ship is −0.133 and is highly statistically significant, indicating that a one-day increase in delivery time causally reduces sales by approximately **13%**. In addition, a t-value of -21 and p-value less than 2e-16 explain that the estimated effect of shipping delays is precisely estimated.
+
+Also, with the "weak instrument test", the statistic value is 14,082 which overwhelms the rule of thumb and "weather" seems to be a strong IV.
+
+Finally, with the Wu–Hausman test(Are OLS and IV estimates statistically different?), the p-value shows as 0.00527, and proves to be statistically significant. In other words, shipping time is endogenous, supporting the use of an IV approach.
+
+### Non-Technical Interpretation: The “Weather” Experiment
+
+To understand the impact of shipping speed, we cannot simply compare fast- and slow-shipping products. For example, a small lamp usually ships faster than a heavy sofa, but the two products also differ in price and customer appeal.
+
+To focus only on delivery speed, we use weather-related shipping delays as a natural comparison. Severe weather can slow down deliveries, but it does not change how much customers value a product itself. This allows us to see how sales respond specifically to delays in shipping time.
+
+The results show that customers are highly sensitive to delivery speed. Even when product features and customer preferences stay the same, shipping delays alone are associated with meaningful revenue losses. For the business, this means that reducing delivery delays—especially for products most exposed to logistical disruptions—can have a direct and measurable impact on sales.
+
+### Business implications
+
+These findings have clear implications for Wayfair’s operations. Since shipping delays have a measurable negative impact on sales, investments aimed at reducing delivery times—such as improving logistics efficiency or increasing inventory availability—could lead to meaningful revenue gains. The results also suggest that products most affected by shipping disruptions, such as heavier items or those exposed to weather-related delays, may benefit the most from targeted operational improvements. This suggests that prioritizing faster fulfillment or buffering inventory for these products could deliver disproportionate returns.
+
+### Summary
+
+**Overview and Research Question：** This project examines the causal impact of delivery speed on product sales. While faster shipping is generally believed to increase customer demand, estimating its true effect is challenging due to potential confounding factors and endogeneity—such as product characteristics and operational decisions that simultaneously affect both shipping time and sales. Our goal is to isolate the causal effect of shipping delays on sales outcomes using multiple complementary empirical approaches.
+
+**Methodological Approach：** We implement a sequence of models with increasing levels of control and causal rigor. First, we estimate a baseline OLS model that relates sales to average shipping time. We then extend this model by controlling for key product characteristics, including popularity, price, weight, fulfillment type, and category, to address omitted variable bias.
+
+To further account for potential endogeneity in shipping time, we estimate an instrumental variables (2SLS) model using weather exposure as an instrument. This instrument affects delivery speed through logistical disruptions but does not directly impact consumer demand, making it well-suited for identifying causal effects. Throughout the analysis, we summarize results using standardized regression tables and diagnostic statistics generated directly from the estimation code to ensure transparency and reproducibility.
+
+**Key Findings and Robustness：** Across all model specifications, we find a consistently negative relationship between shipping time and sales. The baseline OLS estimate indicates a large negative association. When we add observable product controls, the esimated coefficient becoomes somewhat larger in magnitude, suggesting that the baseline OLS may have understated the adverse effect due to omitted confounders. The IV (2SLS) estimate based on weather exposure is also negative and statistically significant (-13.3%), but slightly smaller in magnitude thatn the long OLS estimate.
+
+**Business Implications：** From a business perspective, the results highlight delivery speed as a critical operational lever. Based on the IV estimates, an additional day in average shipping time is associated with approximately a 13.3% decrease in annual sales per product within our dataset. This suggests that customers are highly sensitive to delivery delays, and even small disruptions can lead to meaningful revenue losses.
+
+These findings imply that investments aimed at reducing shipping times such as improving logistics efficiency, optimizing inventory placement, or prioritizing faster fulfillment for delay-prone products may yield substantial returns. In particular, heavier items or products more exposed to weather-related delays may benefit most from targeted operational improvements.
+
+```{r}
+iv_coef <- coef(model_iv)["avg_days_to_ship"]
+iv_se   <- sqrt(diag(vcov(model_iv)))["avg_days_to_ship"]
+
+
+data.frame(
+  Model = "IV (2SLS)",
+  Interpretation = "Effect of 1 additional shipping day on sales",
+  Estimate = round(iv_coef, 5),
+  Std_Error = round(iv_se, 5)
+)
+```
+
+## Conclusion
+
+Overall, this project provides robust evidence that delivery speed has a causal and economically significant impact on sales. By combining multiple econometric methods, careful diagnostic testing, and transparent coding practices, we show that the negative effect of shipping delays persists across specifications and is unlikely to be driven by modeling choices alone. These results underscore the strategic importance of fulfillment and logistics decisions in shaping firm performance.
